@@ -92,49 +92,43 @@ $lists    = @($listsRaw | ConvertFrom-Json) | Where-Object { $_.name -ne "Flagge
 
 Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
 
-# -- 5. Read all tasks ---------------------------------------------------------
+# -- 5. Read all tasks via CSV (most reliable cross-platform approach) ----------
 Write-Host "Reading tasks..." -ForegroundColor Cyan
 
-# Write a SQL script file so sqlite3 can use .output with a proper Windows path
-$tempTasksFile  = Join-Path $env:TEMP "knotdo_tasks.json"
+$tempTasksCsv   = Join-Path $env:TEMP "knotdo_tasks.csv"
 $tempScriptFile = Join-Path $env:TEMP "knotdo_query.sql"
-$winPath        = $tempTasksFile.Replace('\', '/')
 
-Set-Content -Path $tempScriptFile -Encoding ASCII -Value @"
-.mode json
-.output $winPath
-SELECT local_id, task_folder_local_id, subject, status, importance, due_date, completed_datetime, body_content FROM tasks WHERE deleted=0;
-"@
+# Write sqlite3 script to a file - CSV avoids JSON parsing issues
+$csvPath = $tempTasksCsv.Replace('\', '/')
+Set-Content -Path $tempScriptFile -Encoding ASCII -Value ".separator `",`"
+.headers on
+.output $csvPath
+SELECT t.local_id, t.task_folder_local_id, f.name as list_name, t.subject, t.status, t.importance, t.due_date, t.completed_datetime, t.body_content FROM tasks t LEFT JOIN task_folders f ON t.task_folder_local_id = f.local_id WHERE t.deleted=0;
+.quit"
 
-& $sqlitePath $tempDb ".read $($tempScriptFile.Replace('\','/'))"
+# Run sqlite3 with stdin redirected from the script file (avoids pipeline size limits)
+$proc = Start-Process -FilePath $sqlitePath -ArgumentList $tempDb `
+    -RedirectStandardInput $tempScriptFile `
+    -RedirectStandardError "$env:TEMP\knotdo_err.txt" `
+    -Wait -NoNewWindow -PassThru
+
 Remove-Item $tempScriptFile -Force -ErrorAction SilentlyContinue
 
-# If .output worked, file exists; if not, fall back to direct stdout capture
 $allTasks = @()
-if (Test-Path $tempTasksFile) {
-    $tasksRaw = Get-Content $tempTasksFile -Raw -ErrorAction SilentlyContinue
-    Remove-Item $tempTasksFile -Force -ErrorAction SilentlyContinue
-    if ($tasksRaw -and $tasksRaw.Trim() -ne '' -and $tasksRaw.Trim() -ne '[]') {
-        $allTasks = @($tasksRaw | ConvertFrom-Json)
-    }
+if (Test-Path $tempTasksCsv) {
+    $allTasks = @(Import-Csv $tempTasksCsv)
+    Remove-Item $tempTasksCsv -Force -ErrorAction SilentlyContinue
 }
-
-# Fallback: capture stdout directly (works for up to ~50k tasks)
-if ($allTasks.Count -eq 0) {
-    Write-Host "  (using stdout capture fallback)" -ForegroundColor DarkGray
-    $captured  = @(".mode json", "SELECT local_id, task_folder_local_id, subject, status, importance, due_date, completed_datetime, body_content FROM tasks WHERE deleted=0;") -join "`n" | & $sqlitePath $tempDb
-    $capturedStr = ($captured -join "")
-    if ($capturedStr -and $capturedStr.Trim() -ne '' -and $capturedStr.Trim() -ne '[]') {
-        $allTasks = @($capturedStr | ConvertFrom-Json)
-    }
-}
+Remove-Item "$env:TEMP\knotdo_err.txt" -Force -ErrorAction SilentlyContinue
 
 Write-Host "Found $($allTasks.Count) task(s) total." -ForegroundColor Green
 
-# Group tasks by list
+# Tasks already have list_name from JOIN - no grouping needed, just index by local_id
 $tasksByList = @{}
-if ($allTasks.Count -gt 0) {
-    $tasksByList = $allTasks | Group-Object -Property "task_folder_local_id" -AsHashTable -AsString
+foreach ($t in $allTasks) {
+    $fid = $t.task_folder_local_id
+    if (-not $tasksByList.ContainsKey($fid)) { $tasksByList[$fid] = [System.Collections.ArrayList]::new() }
+    [void]$tasksByList[$fid].Add($t)
 }
 
 # -- 6. Build export -----------------------------------------------------------
