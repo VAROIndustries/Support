@@ -127,6 +127,7 @@ Write-Host "Found $($allTasks.Count) task(s) total." -ForegroundColor Green
 $tasksByList = @{}
 foreach ($t in $allTasks) {
     $fid = $t.task_folder_local_id
+    if (-not $fid) { continue }
     if (-not $tasksByList.ContainsKey($fid)) { $tasksByList[$fid] = [System.Collections.ArrayList]::new() }
     [void]$tasksByList[$fid].Add($t)
 }
