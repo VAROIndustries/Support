@@ -19,9 +19,11 @@
 $ErrorActionPreference = "Stop"
 
 # Microsoft Graph Command Line Tools (first-party Microsoft app - no registration needed)
+# Tenant "consumers" = personal Microsoft accounts only (outlook.com, hotmail.com, live.com, Gmail as MSA)
+# This blocks work/school accounts so you cannot accidentally sign into the wrong account.
 $ClientId = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 $Scope    = "Tasks.Read offline_access"
-$Tenant   = "common"
+$Tenant   = "consumers"
 
 # -- 1. Request device code ----------------------------------------------------
 Write-Host ""
@@ -99,16 +101,19 @@ function Get-GraphAll($url) {
     $all     = [System.Collections.Generic.List[object]]::new()
     $nextUrl = $url
     while ($nextUrl) {
-        $resp    = Invoke-RestMethod -Uri $nextUrl -Headers $headers
-        if ($resp.value) { $all.AddRange($resp.value) }
+        $resp = Invoke-RestMethod -Uri $nextUrl -Headers $headers
+        # value may be a single object or an array - always treat as array
+        if ($null -ne $resp.value) {
+            foreach ($item in @($resp.value)) { $all.Add($item) }
+        }
         $nextUrl = $resp.'@odata.nextLink'
     }
-    return $all
+    return ,$all  # comma forces array return even for single-element lists
 }
 
 # -- 4. Fetch all To-Do lists --------------------------------------------------
 Write-Host "Fetching task lists..." -ForegroundColor Cyan
-$lists = Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists"
+$lists = @(Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists")
 Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
 Write-Host ""
 
@@ -124,7 +129,7 @@ $totalTasks = 0
 foreach ($list in $lists) {
     Write-Host "  Fetching: $($list.displayName)..." -ForegroundColor DarkCyan -NoNewline
 
-    $tasks = Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists/$($list.id)/tasks"
+    $tasks = @(Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists/$($list.id)/tasks")
 
     $taskArr = [System.Collections.Generic.List[object]]::new()
     foreach ($t in $tasks) {
