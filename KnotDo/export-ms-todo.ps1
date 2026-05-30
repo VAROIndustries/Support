@@ -1,58 +1,119 @@
 # ==============================================================
 # KnotDo - Microsoft To-Do Graph Export
 # ==============================================================
-# Exports all your To-Do lists and tasks to a JSON file
-# using the Microsoft Graph PowerShell SDK.
+# Exports all your To-Do lists and tasks to a JSON file.
 #
 # No Azure app registration required.
-# Uses Microsoft's own first-party Graph Command Line Tools client.
+# No module installation required - uses raw Graph API REST calls.
+# Works on Windows PowerShell 5.1+ out of the box.
 #
 # USAGE:
 #   1. Open PowerShell (Windows Terminal or Start Menu)
-#   2. Run:  .\scripts\export-ms-todo.ps1
-#   3. You will get a code to enter at microsoft.com/devicelogin
-#      Sign in with the Microsoft account that has your To-Do tasks
-#   4. The export saves to your Downloads folder as ms-todo-export.json
-#   5. Upload that file to KnotDo > Import > Microsoft Graph Export
+#   2. Run:  .\export-ms-todo.ps1
+#   3. Open the URL shown, enter the code, sign in with the
+#      Microsoft account that has your To-Do tasks
+#   4. Export saves to Downloads\ms-todo-export.json
+#   5. Upload to KnotDo > Import > Microsoft Graph Export
 # ==============================================================
 
 $ErrorActionPreference = "Stop"
 
-# -- 1. Install Microsoft.Graph.Tasks module if needed -------------------------
-Write-Host ""
-Write-Host "Checking for Microsoft.Graph.Tasks module..." -ForegroundColor Cyan
+# Microsoft Graph Command Line Tools (first-party Microsoft app - no registration needed)
+$ClientId = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+$Scope    = "Tasks.Read offline_access"
+$Tenant   = "common"
 
-if (-not (Get-Module -ListAvailable -Name "Microsoft.Graph.Tasks" -ErrorAction SilentlyContinue)) {
-    Write-Host "Installing Microsoft.Graph.Tasks (this may take a minute)..." -ForegroundColor Yellow
-    Install-Module "Microsoft.Graph.Tasks" -Scope CurrentUser -Force -AllowClobber
-    Write-Host "Installed." -ForegroundColor Green
-} else {
-    Write-Host "Module already installed." -ForegroundColor Green
+# -- 1. Request device code ----------------------------------------------------
+Write-Host ""
+Write-Host "Requesting sign-in code from Microsoft..." -ForegroundColor Cyan
+
+$deviceCodeBody = @{
+    client_id = $ClientId
+    scope     = $Scope
 }
 
-Import-Module "Microsoft.Graph.Tasks" -ErrorAction Stop
-
-# -- 2. Connect to Microsoft Graph ---------------------------------------------
-Write-Host ""
-Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
-Write-Host "You will receive a code to enter at: https://microsoft.com/devicelogin" -ForegroundColor DarkGray
-Write-Host "Sign in with the Microsoft account that contains your To-Do tasks." -ForegroundColor DarkGray
-Write-Host ""
-
-Connect-MgGraph -Scopes "Tasks.Read" -UseDeviceAuthentication -NoWelcome
+$deviceCode = Invoke-RestMethod `
+    -Method POST `
+    -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/devicecode" `
+    -ContentType "application/x-www-form-urlencoded" `
+    -Body $deviceCodeBody
 
 Write-Host ""
-Write-Host "Connected!" -ForegroundColor Green
-
-# -- 3. Fetch all To-Do lists --------------------------------------------------
+Write-Host "================================================================" -ForegroundColor Yellow
+Write-Host $deviceCode.message -ForegroundColor Yellow
+Write-Host "================================================================" -ForegroundColor Yellow
 Write-Host ""
+
+# -- 2. Poll for token ---------------------------------------------------------
+Write-Host "Waiting for you to sign in..." -ForegroundColor DarkGray
+
+$tokenBody = @{
+    grant_type  = "urn:ietf:params:oauth:grant-type:device_code"
+    client_id   = $ClientId
+    device_code = $deviceCode.device_code
+}
+
+$token       = $null
+$interval    = [int]$deviceCode.interval
+$expiresSecs = [int]$deviceCode.expires_in
+$waited      = 0
+
+while ($waited -lt $expiresSecs) {
+    Start-Sleep -Seconds $interval
+    $waited += $interval
+
+    try {
+        $token = Invoke-RestMethod `
+            -Method POST `
+            -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token" `
+            -ContentType "application/x-www-form-urlencoded" `
+            -Body $tokenBody
+        break
+    } catch {
+        $raw = $_.ErrorDetails.Message
+        if ($raw) {
+            try {
+                $errObj = $raw | ConvertFrom-Json
+                if ($errObj.error -eq "authorization_pending") { continue }
+                if ($errObj.error -eq "authorization_declined") { throw "Sign-in was declined. Run the script again." }
+                if ($errObj.error -eq "expired_token")          { throw "The code expired. Run the script again." }
+            } catch [System.Management.Automation.RuntimeException] { throw }
+            catch { }
+        }
+        throw
+    }
+}
+
+if (-not $token) {
+    Write-Host "ERROR: Sign-in timed out. Run the script again." -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "Signed in!" -ForegroundColor Green
+Write-Host ""
+
+$headers = @{ Authorization = "Bearer $($token.access_token)" }
+
+# -- 3. Helper: paginated Graph GET --------------------------------------------
+function Get-GraphAll($url) {
+    $all     = [System.Collections.Generic.List[object]]::new()
+    $nextUrl = $url
+    while ($nextUrl) {
+        $resp    = Invoke-RestMethod -Uri $nextUrl -Headers $headers
+        if ($resp.value) { $all.AddRange($resp.value) }
+        $nextUrl = $resp.'@odata.nextLink'
+    }
+    return $all
+}
+
+# -- 4. Fetch all To-Do lists --------------------------------------------------
 Write-Host "Fetching task lists..." -ForegroundColor Cyan
+$lists = Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists"
+Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
+Write-Host ""
 
-$mgLists = Get-MgUserTodoList -UserId "me" -All
-Write-Host "Found $($mgLists.Count) list(s)." -ForegroundColor Green
-
-# -- 4. Fetch tasks for each list ----------------------------------------------
-$export = @{
+# -- 5. Fetch tasks for each list ----------------------------------------------
+$export = [ordered]@{
     exportedAt = (Get-Date -Format "o")
     source     = "microsoft-graph"
     lists      = [System.Collections.Generic.List[object]]::new()
@@ -60,50 +121,50 @@ $export = @{
 
 $totalTasks = 0
 
-foreach ($list in $mgLists) {
-    Write-Host "  Fetching: $($list.DisplayName)..." -ForegroundColor DarkCyan -NoNewline
+foreach ($list in $lists) {
+    Write-Host "  Fetching: $($list.displayName)..." -ForegroundColor DarkCyan -NoNewline
 
-    $mgTasks = Get-MgUserTodoListTask -TodoTaskListId $list.Id -UserId "me" -All
+    $tasks = Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists/$($list.id)/tasks"
 
     $taskArr = [System.Collections.Generic.List[object]]::new()
-    foreach ($t in $mgTasks) {
-        $taskArr.Add(@{
-            id                   = $t.Id
-            title                = $t.Title
-            status               = $t.Status
-            importance           = $t.Importance
-            dueDateTime          = if ($t.DueDateTime)       { @{ dateTime = $t.DueDateTime.DateTime;       timeZone = $t.DueDateTime.TimeZone       } } else { $null }
-            completedDateTime    = if ($t.CompletedDateTime) { @{ dateTime = $t.CompletedDateTime.DateTime; timeZone = $t.CompletedDateTime.TimeZone } } else { $null }
-            body                 = if ($t.Body)              { @{ content = $t.Body.Content; contentType = $t.Body.ContentType } } else { $null }
-            createdDateTime      = $t.CreatedDateTime
-            lastModifiedDateTime = $t.LastModifiedDateTime
+    foreach ($t in $tasks) {
+        $taskArr.Add([ordered]@{
+            id                   = $t.id
+            title                = $t.title
+            status               = $t.status
+            importance           = $t.importance
+            dueDateTime          = $t.dueDateTime
+            completedDateTime    = $t.completedDateTime
+            body                 = $t.body
+            createdDateTime      = $t.createdDateTime
+            lastModifiedDateTime = $t.lastModifiedDateTime
         })
     }
 
-    $export.lists.Add(@{
-        id          = $list.Id
-        displayName = $list.DisplayName
-        isOwner     = $list.IsOwner
+    $export.lists.Add([ordered]@{
+        id          = $list.id
+        displayName = $list.displayName
+        isOwner     = $list.isOwner
         tasks       = $taskArr
     })
 
-    $totalTasks += $mgTasks.Count
-    Write-Host " $($mgTasks.Count) tasks" -ForegroundColor Gray
+    $totalTasks += $tasks.Count
+    Write-Host " $($tasks.Count) tasks" -ForegroundColor Gray
 }
 
-# -- 5. Save to Downloads ------------------------------------------------------
+# -- 6. Save to Downloads ------------------------------------------------------
 $outputPath = Join-Path $env:USERPROFILE "Downloads\ms-todo-export.json"
 
 Write-Host ""
-Write-Host "Saving export..." -ForegroundColor Cyan
+Write-Host "Saving..." -ForegroundColor Cyan
 $export | ConvertTo-Json -Depth 10 -Compress | Out-File -FilePath $outputPath -Encoding UTF8
 
-$fileSizeMB = [math]::Round((Get-Item $outputPath).Length / 1MB, 1)
+$fileSizeMB = [math]::Round((Get-Item $outputPath).Length / 1MB, 2)
 
 Write-Host ""
 Write-Host "==============================================================" -ForegroundColor Green
 Write-Host "Export complete!" -ForegroundColor Green
-Write-Host "  Lists : $($mgLists.Count)" -ForegroundColor White
+Write-Host "  Lists : $($lists.Count)" -ForegroundColor White
 Write-Host "  Tasks : $($totalTasks.ToString('N0'))" -ForegroundColor White
 Write-Host "  Size  : $fileSizeMB MB" -ForegroundColor White
 Write-Host "  Saved : $outputPath" -ForegroundColor White
@@ -111,5 +172,3 @@ Write-Host "==============================================================" -For
 Write-Host ""
 Write-Host "Next: upload ms-todo-export.json to KnotDo > Import > Microsoft Graph Export" -ForegroundColor Cyan
 Write-Host ""
-
-Disconnect-MgGraph | Out-Null
