@@ -92,28 +92,42 @@ $lists    = @($listsRaw | ConvertFrom-Json) | Where-Object { $_.name -ne "Flagge
 
 Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
 
-# -- 5. Read all tasks (write to file - pipeline can't handle 100k+ rows) ------
+# -- 5. Read all tasks ---------------------------------------------------------
 Write-Host "Reading tasks..." -ForegroundColor Cyan
 
-$tempTasksFile = Join-Path $env:TEMP "knotdo_tasks.json"
-# sqlite3 .output requires forward slashes on Windows
-$tempTasksFileSlash = $tempTasksFile.Replace('\', '/')
+# Write a SQL script file so sqlite3 can use .output with a proper Windows path
+$tempTasksFile  = Join-Path $env:TEMP "knotdo_tasks.json"
+$tempScriptFile = Join-Path $env:TEMP "knotdo_query.sql"
+$winPath        = $tempTasksFile.Replace('\', '/')
 
-$taskSql = @"
+Set-Content -Path $tempScriptFile -Encoding ASCII -Value @"
 .mode json
-.output $tempTasksFileSlash
+.output $winPath
 SELECT local_id, task_folder_local_id, subject, status, importance, due_date, completed_datetime, body_content FROM tasks WHERE deleted=0;
-.quit
 "@
 
-$taskSql | & $sqlitePath $tempDb
+& $sqlitePath $tempDb ".read $($tempScriptFile.Replace('\','/'))"
+Remove-Item $tempScriptFile -Force -ErrorAction SilentlyContinue
 
-$tasksRaw = Get-Content $tempTasksFile -Raw -ErrorAction SilentlyContinue
-$allTasks  = @()
-if ($tasksRaw -and $tasksRaw.Trim() -ne '' -and $tasksRaw.Trim() -ne '[]') {
-    $allTasks = @($tasksRaw | ConvertFrom-Json)
+# If .output worked, file exists; if not, fall back to direct stdout capture
+$allTasks = @()
+if (Test-Path $tempTasksFile) {
+    $tasksRaw = Get-Content $tempTasksFile -Raw -ErrorAction SilentlyContinue
+    Remove-Item $tempTasksFile -Force -ErrorAction SilentlyContinue
+    if ($tasksRaw -and $tasksRaw.Trim() -ne '' -and $tasksRaw.Trim() -ne '[]') {
+        $allTasks = @($tasksRaw | ConvertFrom-Json)
+    }
 }
-Remove-Item $tempTasksFile -Force -ErrorAction SilentlyContinue
+
+# Fallback: capture stdout directly (works for up to ~50k tasks)
+if ($allTasks.Count -eq 0) {
+    Write-Host "  (using stdout capture fallback)" -ForegroundColor DarkGray
+    $captured  = @(".mode json", "SELECT local_id, task_folder_local_id, subject, status, importance, due_date, completed_datetime, body_content FROM tasks WHERE deleted=0;") -join "`n" | & $sqlitePath $tempDb
+    $capturedStr = ($captured -join "")
+    if ($capturedStr -and $capturedStr.Trim() -ne '' -and $capturedStr.Trim() -ne '[]') {
+        $allTasks = @($capturedStr | ConvertFrom-Json)
+    }
+}
 
 Write-Host "Found $($allTasks.Count) task(s) total." -ForegroundColor Green
 
