@@ -92,20 +92,36 @@ $lists    = @($listsRaw | ConvertFrom-Json) | Where-Object { $_.name -ne "Flagge
 
 Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
 
-# -- 5. Read all tasks ---------------------------------------------------------
+# -- 5. Read all tasks (write to file - pipeline can't handle 100k+ rows) ------
 Write-Host "Reading tasks..." -ForegroundColor Cyan
+
+$tempTasksFile = Join-Path $env:TEMP "knotdo_tasks.json"
+# sqlite3 .output requires forward slashes on Windows
+$tempTasksFileSlash = $tempTasksFile.Replace('\', '/')
 
 $taskSql = @"
 .mode json
-SELECT local_id, task_folder_local_id, subject, status, importance, due_date, completed_datetime, body_content
-FROM tasks WHERE deleted=0;
+.output $tempTasksFileSlash
+SELECT local_id, task_folder_local_id, subject, status, importance, due_date, completed_datetime, body_content FROM tasks WHERE deleted=0;
+.quit
 "@
 
-$tasksRaw = $taskSql | & $sqlitePath $tempDb
-$allTasks = @($tasksRaw | ConvertFrom-Json)
+$taskSql | & $sqlitePath $tempDb
 
-# Group tasks by list (use Group-Object to avoid PS 5.1 generic List quirks)
-$tasksByList = $allTasks | Group-Object -Property "task_folder_local_id" -AsHashTable -AsString
+$tasksRaw = Get-Content $tempTasksFile -Raw -ErrorAction SilentlyContinue
+$allTasks  = @()
+if ($tasksRaw -and $tasksRaw.Trim() -ne '' -and $tasksRaw.Trim() -ne '[]') {
+    $allTasks = @($tasksRaw | ConvertFrom-Json)
+}
+Remove-Item $tempTasksFile -Force -ErrorAction SilentlyContinue
+
+Write-Host "Found $($allTasks.Count) task(s) total." -ForegroundColor Green
+
+# Group tasks by list
+$tasksByList = @{}
+if ($allTasks.Count -gt 0) {
+    $tasksByList = $allTasks | Group-Object -Property "task_folder_local_id" -AsHashTable -AsString
+}
 
 # -- 6. Build export -----------------------------------------------------------
 $export = [ordered]@{
