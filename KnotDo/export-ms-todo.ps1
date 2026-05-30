@@ -100,7 +100,7 @@ $tempScriptFile = Join-Path $env:TEMP "knotdo_query.sql"
 
 # Write sqlite3 script to a file - CSV avoids JSON parsing issues
 $csvPath = $tempTasksCsv.Replace('\', '/')
-Set-Content -Path $tempScriptFile -Encoding ASCII -Value ".separator `",`"
+Set-Content -Path $tempScriptFile -Encoding ASCII -Value ".mode csv
 .headers on
 .output $csvPath
 SELECT t.local_id, t.task_folder_local_id, f.name as list_name, t.subject, t.status, t.importance, t.due_date, t.completed_datetime, t.body_content FROM tasks t LEFT JOIN task_folders f ON t.task_folder_local_id = f.local_id WHERE t.deleted=0;
