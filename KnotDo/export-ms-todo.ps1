@@ -84,11 +84,11 @@ Write-Host "Reading lists..." -ForegroundColor Cyan
 
 $listSql = @"
 .mode json
-SELECT local_id, name FROM task_folders WHERE deleted=0 AND (folder_type IS NULL OR folder_type NOT IN ('FlaggedEmail','FlaggedEmails'));
+SELECT local_id, name, folder_type FROM task_folders WHERE deleted=0;
 "@
 
 $listsRaw = $listSql | & $sqlitePath $tempDb
-$lists    = @($listsRaw | ConvertFrom-Json)
+$lists    = @($listsRaw | ConvertFrom-Json) | Where-Object { $_.name -ne "Flagged Email" -and $_.name -ne "Flagged Emails" }
 
 Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
 
@@ -104,26 +104,21 @@ FROM tasks WHERE deleted=0;
 $tasksRaw = $taskSql | & $sqlitePath $tempDb
 $allTasks = @($tasksRaw | ConvertFrom-Json)
 
-# Group tasks by list
-$tasksByList = @{}
-foreach ($t in $allTasks) {
-    $fid = $t.task_folder_local_id
-    if (-not $tasksByList.ContainsKey($fid)) { $tasksByList[$fid] = [System.Collections.Generic.List[object]]::new() }
-    $tasksByList[$fid].Add($t)
-}
+# Group tasks by list (use Group-Object to avoid PS 5.1 generic List quirks)
+$tasksByList = $allTasks | Group-Object -Property "task_folder_local_id" -AsHashTable -AsString
 
 # -- 6. Build export -----------------------------------------------------------
 $export = [ordered]@{
     exportedAt = (Get-Date -Format "o")
     source     = "microsoft-graph"
-    lists      = [System.Collections.Generic.List[object]]::new()
+    lists      = [System.Collections.ArrayList]::new()
 }
 
 $totalTasks = 0
 
 foreach ($list in $lists) {
-    $tasks   = if ($tasksByList.ContainsKey($list.local_id)) { @($tasksByList[$list.local_id]) } else { @() }
-    $taskArr = [System.Collections.Generic.List[object]]::new()
+    $tasks   = if ($tasksByList -and $tasksByList.ContainsKey($list.local_id)) { @($tasksByList[$list.local_id]) } else { @() }
+    $taskArr = [System.Collections.ArrayList]::new()
 
     foreach ($t in $tasks) {
         $status = switch ($t.status) {
@@ -134,7 +129,7 @@ foreach ($list in $lists) {
         }
         $importance = if ([int]$t.importance -ge 1) { "high" } else { "normal" }
 
-        $taskArr.Add([ordered]@{
+        [void]$taskArr.Add([ordered]@{
             id                = $t.local_id
             title             = $t.subject
             status            = $status
@@ -145,7 +140,7 @@ foreach ($list in $lists) {
         })
     }
 
-    $export.lists.Add([ordered]@{
+    [void]$export.lists.Add([ordered]@{
         id          = $list.local_id
         displayName = $list.name
         isOwner     = $true
