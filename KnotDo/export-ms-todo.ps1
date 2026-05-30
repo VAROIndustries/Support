@@ -1,123 +1,118 @@
 # ==============================================================
-# KnotDo - Microsoft To-Do Graph Export
+# KnotDo - Microsoft To-Do Local Export
 # ==============================================================
-# Exports all your To-Do lists and tasks to a JSON file.
-#
+# Reads directly from the Microsoft To-Do app's local database.
+# No Microsoft account sign-in required.
 # No Azure app registration required.
-# No module installation required - uses raw Graph API REST calls.
-# Works on Windows PowerShell 5.1+ out of the box.
+# Works completely offline.
+#
+# REQUIREMENTS:
+#   - Microsoft To-Do app installed (from Microsoft Store)
+#   - The app must have synced at least once so data is local
 #
 # USAGE:
-#   1. Open PowerShell (Windows Terminal or Start Menu)
+#   1. Open PowerShell
 #   2. Run:  .\export-ms-todo.ps1
-#   3. Open the URL shown, enter the code, sign in with the
-#      Microsoft account that has your To-Do tasks
-#   4. Export saves to Downloads\ms-todo-export.json
-#   5. Upload to KnotDo > Import > Microsoft Graph Export
+#   3. Upload Downloads\ms-todo-export.json to KnotDo > Import
 # ==============================================================
 
 $ErrorActionPreference = "Stop"
 
-# Microsoft Graph Command Line Tools (first-party Microsoft app - no registration needed)
-# Tenant "consumers" = personal Microsoft accounts only (outlook.com, hotmail.com, live.com, Gmail as MSA)
-# This blocks work/school accounts so you cannot accidentally sign into the wrong account.
-$ClientId = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
-$Scope    = "Tasks.Read offline_access"
-$Tenant   = "consumers"
-
-# -- 1. Request device code ----------------------------------------------------
+# -- 1. Find the To-Do local database ------------------------------------------
 Write-Host ""
-Write-Host "Requesting sign-in code from Microsoft..." -ForegroundColor Cyan
+Write-Host "Looking for Microsoft To-Do database..." -ForegroundColor Cyan
 
-$deviceCodeBody = @{
-    client_id = $ClientId
-    scope     = $Scope
-}
+$accountsRoot = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.Todos_8wekyb3d8bbwe\LocalState\AccountsRoot"
 
-$deviceCode = Invoke-RestMethod `
-    -Method POST `
-    -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/devicecode" `
-    -ContentType "application/x-www-form-urlencoded" `
-    -Body $deviceCodeBody
-
-Write-Host ""
-Write-Host "================================================================" -ForegroundColor Yellow
-Write-Host $deviceCode.message -ForegroundColor Yellow
-Write-Host "================================================================" -ForegroundColor Yellow
-Write-Host ""
-
-# -- 2. Poll for token ---------------------------------------------------------
-Write-Host "Waiting for you to sign in..." -ForegroundColor DarkGray
-
-$tokenBody = @{
-    grant_type  = "urn:ietf:params:oauth:grant-type:device_code"
-    client_id   = $ClientId
-    device_code = $deviceCode.device_code
-}
-
-$token       = $null
-$interval    = [int]$deviceCode.interval
-$expiresSecs = [int]$deviceCode.expires_in
-$waited      = 0
-
-while ($waited -lt $expiresSecs) {
-    Start-Sleep -Seconds $interval
-    $waited += $interval
-
-    try {
-        $token = Invoke-RestMethod `
-            -Method POST `
-            -Uri "https://login.microsoftonline.com/$Tenant/oauth2/v2.0/token" `
-            -ContentType "application/x-www-form-urlencoded" `
-            -Body $tokenBody
-        break
-    } catch {
-        $raw = $_.ErrorDetails.Message
-        if ($raw) {
-            try {
-                $errObj = $raw | ConvertFrom-Json
-                if ($errObj.error -eq "authorization_pending") { continue }
-                if ($errObj.error -eq "authorization_declined") { throw "Sign-in was declined. Run the script again." }
-                if ($errObj.error -eq "expired_token")          { throw "The code expired. Run the script again." }
-            } catch [System.Management.Automation.RuntimeException] { throw }
-            catch { }
-        }
-        throw
-    }
-}
-
-if (-not $token) {
-    Write-Host "ERROR: Sign-in timed out. Run the script again." -ForegroundColor Red
+if (-not (Test-Path $accountsRoot)) {
+    Write-Host "ERROR: Microsoft To-Do app not found." -ForegroundColor Red
+    Write-Host "Install it from the Microsoft Store, open it, and let it sync first." -ForegroundColor Yellow
     exit 1
 }
 
-Write-Host "Signed in!" -ForegroundColor Green
-Write-Host ""
+$dbPath = Get-ChildItem $accountsRoot -Recurse -Filter "todosqlite.db" | Select-Object -First 1 -ExpandProperty FullName
 
-$headers = @{ Authorization = "Bearer $($token.access_token)" }
-
-# -- 3. Helper: paginated Graph GET --------------------------------------------
-function Get-GraphAll($url) {
-    $all     = [System.Collections.Generic.List[object]]::new()
-    $nextUrl = $url
-    while ($nextUrl) {
-        $resp = Invoke-RestMethod -Uri $nextUrl -Headers $headers
-        # value may be a single object or an array - always treat as array
-        if ($null -ne $resp.value) {
-            foreach ($item in @($resp.value)) { $all.Add($item) }
-        }
-        $nextUrl = $resp.'@odata.nextLink'
-    }
-    return ,$all  # comma forces array return even for single-element lists
+if (-not $dbPath) {
+    Write-Host "ERROR: To-Do database file not found. Open the To-Do app and wait for it to sync." -ForegroundColor Red
+    exit 1
 }
 
-# -- 4. Fetch all To-Do lists --------------------------------------------------
-Write-Host "Fetching task lists..." -ForegroundColor Cyan
-$lists = @(Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists")
-Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
-Write-Host ""
+$dbSizeMB = [math]::Round((Get-Item $dbPath).Length / 1MB, 1)
+Write-Host "Found database ($dbSizeMB MB)" -ForegroundColor Green
 
-# -- 5. Fetch tasks for each list ----------------------------------------------
+# -- 2. Download sqlite3.exe if not already present ----------------------------
+$sqlitePath = Join-Path $env:TEMP "knotdo_sqlite3.exe"
+
+if (-not (Test-Path $sqlitePath)) {
+    Write-Host "Downloading sqlite3 (one-time, ~2MB)..." -ForegroundColor Cyan
+
+    # Fetch the sqlite.org download page to get the current version URL
+    $dlPage  = (Invoke-WebRequest -Uri "https://www.sqlite.org/download.html" -UseBasicParsing).Content
+    $match   = [regex]::Match($dlPage, '(20\d\d/sqlite-tools-win-x64-\d+\.zip)')
+
+    if (-not $match.Success) {
+        Write-Host "ERROR: Could not find sqlite3 download URL from sqlite.org." -ForegroundColor Red
+        exit 1
+    }
+
+    $zipUrl  = "https://www.sqlite.org/" + $match.Value
+    $zipPath = Join-Path $env:TEMP "knotdo_sqlite_tools.zip"
+
+    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip   = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    $entry = $zip.Entries | Where-Object { $_.Name -eq "sqlite3.exe" } | Select-Object -First 1
+    if (-not $entry) {
+        $zip.Dispose()
+        Write-Host "ERROR: sqlite3.exe not found inside the downloaded zip." -ForegroundColor Red
+        exit 1
+    }
+    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $sqlitePath, $true)
+    $zip.Dispose()
+    Remove-Item $zipPath -Force
+
+    Write-Host "sqlite3 ready." -ForegroundColor Green
+}
+
+# -- 3. Copy DB to temp (never lock the live file) -----------------------------
+$tempDb = Join-Path $env:TEMP "knotdo_todo_export.db"
+Copy-Item $dbPath $tempDb -Force
+
+# -- 4. Read all lists ---------------------------------------------------------
+Write-Host "Reading lists..." -ForegroundColor Cyan
+
+$listSql = @"
+.mode json
+SELECT local_id, name FROM task_folders WHERE deleted=0 AND (folder_type IS NULL OR folder_type NOT IN ('FlaggedEmail','FlaggedEmails'));
+"@
+
+$listsRaw = $listSql | & $sqlitePath $tempDb
+$lists    = @($listsRaw | ConvertFrom-Json)
+
+Write-Host "Found $($lists.Count) list(s)." -ForegroundColor Green
+
+# -- 5. Read all tasks ---------------------------------------------------------
+Write-Host "Reading tasks..." -ForegroundColor Cyan
+
+$taskSql = @"
+.mode json
+SELECT local_id, task_folder_local_id, subject, status, importance, due_date, completed_datetime, body_content
+FROM tasks WHERE deleted=0;
+"@
+
+$tasksRaw = $taskSql | & $sqlitePath $tempDb
+$allTasks = @($tasksRaw | ConvertFrom-Json)
+
+# Group tasks by list
+$tasksByList = @{}
+foreach ($t in $allTasks) {
+    $fid = $t.task_folder_local_id
+    if (-not $tasksByList.ContainsKey($fid)) { $tasksByList[$fid] = [System.Collections.Generic.List[object]]::new() }
+    $tasksByList[$fid].Add($t)
+}
+
+# -- 6. Build export -----------------------------------------------------------
 $export = [ordered]@{
     exportedAt = (Get-Date -Format "o")
     source     = "microsoft-graph"
@@ -127,51 +122,54 @@ $export = [ordered]@{
 $totalTasks = 0
 
 foreach ($list in $lists) {
-    Write-Host "  Fetching: $($list.displayName)..." -ForegroundColor DarkCyan -NoNewline
-
-    $tasks = @(Get-GraphAll "https://graph.microsoft.com/v1.0/me/todo/lists/$($list.id)/tasks")
-
+    $tasks   = if ($tasksByList.ContainsKey($list.local_id)) { @($tasksByList[$list.local_id]) } else { @() }
     $taskArr = [System.Collections.Generic.List[object]]::new()
+
     foreach ($t in $tasks) {
+        $status = switch ($t.status) {
+            "NotStarted" { "notStarted" }
+            "InProgress" { "inProgress" }
+            "Completed"  { "completed"  }
+            default      { "notStarted" }
+        }
+        $importance = if ([int]$t.importance -ge 1) { "high" } else { "normal" }
+
         $taskArr.Add([ordered]@{
-            id                   = $t.id
-            title                = $t.title
-            status               = $t.status
-            importance           = $t.importance
-            dueDateTime          = $t.dueDateTime
-            completedDateTime    = $t.completedDateTime
-            body                 = $t.body
-            createdDateTime      = $t.createdDateTime
-            lastModifiedDateTime = $t.lastModifiedDateTime
+            id                = $t.local_id
+            title             = $t.subject
+            status            = $status
+            importance        = $importance
+            dueDateTime       = if ($t.due_date)            { [ordered]@{ dateTime = $t.due_date;            timeZone = "UTC" } } else { $null }
+            completedDateTime = if ($t.completed_datetime)  { [ordered]@{ dateTime = $t.completed_datetime;  timeZone = "UTC" } } else { $null }
+            body              = if ($t.body_content)        { [ordered]@{ content = $t.body_content; contentType = "text" } } else { $null }
         })
     }
 
     $export.lists.Add([ordered]@{
-        id          = $list.id
-        displayName = $list.displayName
-        isOwner     = $list.isOwner
+        id          = $list.local_id
+        displayName = $list.name
+        isOwner     = $true
         tasks       = $taskArr
     })
 
     $totalTasks += $tasks.Count
-    Write-Host " $($tasks.Count) tasks" -ForegroundColor Gray
+    Write-Host "  $($list.name): $($tasks.Count) tasks" -ForegroundColor Gray
 }
 
-# -- 6. Save to Downloads ------------------------------------------------------
-$outputPath = Join-Path $env:USERPROFILE "Downloads\ms-todo-export.json"
+# -- 7. Clean up and save ------------------------------------------------------
+Remove-Item $tempDb -Force -ErrorAction SilentlyContinue
 
-Write-Host ""
-Write-Host "Saving..." -ForegroundColor Cyan
+$outputPath = Join-Path $env:USERPROFILE "Downloads\ms-todo-export.json"
 $export | ConvertTo-Json -Depth 10 -Compress | Out-File -FilePath $outputPath -Encoding UTF8
 
-$fileSizeMB = [math]::Round((Get-Item $outputPath).Length / 1MB, 2)
+$outSizeMB = [math]::Round((Get-Item $outputPath).Length / 1MB, 2)
 
 Write-Host ""
 Write-Host "==============================================================" -ForegroundColor Green
 Write-Host "Export complete!" -ForegroundColor Green
 Write-Host "  Lists : $($lists.Count)" -ForegroundColor White
 Write-Host "  Tasks : $($totalTasks.ToString('N0'))" -ForegroundColor White
-Write-Host "  Size  : $fileSizeMB MB" -ForegroundColor White
+Write-Host "  Size  : $outSizeMB MB" -ForegroundColor White
 Write-Host "  Saved : $outputPath" -ForegroundColor White
 Write-Host "==============================================================" -ForegroundColor Green
 Write-Host ""
