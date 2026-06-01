@@ -1,5 +1,7 @@
 # VAROIndustries Support Tools
 
+[![VARØ Industries](https://img.shields.io/badge/VAR%C3%98-Industries-c8883e?style=flat-square)](https://varo.industries)
+
 Support utilities, scripts, and migration tools for VAROIndustries apps.
 
 ## Apps
